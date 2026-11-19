@@ -1,0 +1,182 @@
+name: taskmaster
+
+# Shared by every service built from the project image (same image, different command).
+x-app: &app
+  build: .
+  image: taskmaster:dev
+  restart: unless-stopped
+  environment:
+    TASKMASTER_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-taskmaster}:${POSTGRES_PASSWORD:-taskmaster}@postgres:5432/${POSTGRES_DB:-taskmaster}
+    TASKMASTER_REDIS_URL: redis://redis:6379/0
+    TASKMASTER_LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    # One JSON object per line; set LOG_FORMAT=console for human-readable logs.
+    TASKMASTER_LOG_FORMAT: ${LOG_FORMAT:-json}
+    # API keys: anonymous requests are allowed (rate limited per IP) unless this is true.
+    # "production" refuses to start with dev passwords, plaintext connections or no API keys.
+    TASKMASTER_ENV: ${TASKMASTER_ENV:-development}
+    TASKMASTER_REQUIRE_API_KEY: ${REQUIRE_API_KEY:-false}
+    TASKMASTER_RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-600}
+    TASKMASTER_ANONYMOUS_RATE_LIMIT_PER_MINUTE: ${ANONYMOUS_RATE_LIMIT_PER_MINUTE:-120}
+    TASKMASTER_WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+    TASKMASTER_LEASE_SECONDS: ${LEASE_SECONDS:-30}
+    # Must stay below the worker stop_grace_period (30s).
+    TASKMASTER_WORKER_SHUTDOWN_TIMEOUT: ${WORKER_SHUTDOWN_TIMEOUT:-20}
+    # Services reach object storage by its compose hostname; presigned URLs handed to clients
+    # must use an address the client can reach.
+    TASKMASTER_S3_ENDPOINT_URL: http://s3:9000
+    TASKMASTER_S3_PUBLIC_ENDPOINT_URL: ${S3_PUBLIC_URL:-http://localhost:9000}
+    TASKMASTER_S3_ACCESS_KEY: ${S3_ACCESS_KEY:-taskmaster}
+    TASKMASTER_S3_SECRET_KEY: ${S3_SECRET_KEY:-taskmaster-secret}
+    # Storage janitor: delete unused uploads after this many hours (7 days).
+    # Set TASKMASTER_OUTPUT_RETENTION_HOURS to also expire succeeded jobs' outputs.
+    TASKMASTER_UPLOAD_RETENTION_HOURS: ${UPLOAD_RETENTION_HOURS:-168}
+    # Docker Desktop on Windows/macOS doesn't forward file events into bind mounts reliably.
+    WATCHFILES_FORCE_POLLING: "true"
+  volumes:
+    # Live code for local development (the package is installed in editable mode).
+    - ./src:/app/src:ro
+    - ./migrations:/app/migrations:ro
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taskmaster}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taskmaster}
+      POSTGRES_DB: ${POSTGRES_DB:-taskmaster}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # S3-compatible object storage for job inputs and outputs (RustFS, a MinIO-compatible server).
+  # Console: http://localhost:9001
+  s3:
+    image: rustfs/rustfs:1.0.4
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-taskmaster}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-taskmaster-secret}
+    ports:
+      - "${S3_PORT:-9000}:9000"
+      - "${S3_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - s3data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: apply Alembic migrations, then exit. Everything else waits for it.
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["taskmaster", "api", "--reload"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      # No Redis dependency: the API only writes to Postgres (transactional outbox).
+      migrate:
+        condition: service_completed_successfully
+      # Creates the bucket on startup. Only the file endpoints need object storage afterwards.
+      s3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  relay:
+    <<: *app
+    command: ["taskmaster", "relay"]
+    deploy:
+      replicas: ${RELAY_REPLICAS:-1}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    command: ["taskmaster", "worker"]
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+    # Time for in-flight jobs to finish after SIGTERM before Docker kills the container.
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+
+  # --- Monitoring (docker compose --profile monitoring up) ----------------------------------
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    profiles: [monitoring]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+
+  grafana:
+    image: grafana/grafana:13.2.5
+    profiles: [monitoring]
+    restart: unless-stopped
+    environment:
+      # Local development: open dashboards without logging in (admin/admin to edit).
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/taskmaster.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:
+  redisdata:
+  s3data:
+  prometheusdata:
+  grafanadata:
